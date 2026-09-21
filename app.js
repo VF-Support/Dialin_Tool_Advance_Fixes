@@ -1,6 +1,8 @@
 /* global GUIDES_DEFAULT, CASE_TYPES, icon, getGuides, getGuide, saveGuide, resetGuide,
    createGuide, deleteGuide, subscribeGuides, subscribeCases, addCase, updateCaseStatus,
-   deleteCase, FIREBASE_ENABLED */
+   deleteCase, FIREBASE_ENABLED, getCompletion, subscribeCompletion, addCompletionAgent,
+   renameCompletionAgent, removeCompletionAgent, addCompletionTask, renameCompletionTask,
+   removeCompletionTask, toggleCompletionStatus, agentProgress */
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -105,11 +107,15 @@ function renderSidebarNav() {
 
   const casesActive = hash === '#/cases';
   const allActive = hash === '#/' || hash === '#' || hash === '';
+  const completionActive = hash === '#/completion';
 
   let html = `
     <a href="#/cases" class="nav-link ${casesActive ? 'active' : ''}">
       <span class="icon-row">${icon('clipboard-list', 16)} Pending Case Board</span>
       ${latestPendingCount > 0 ? `<span class="pending-badge">${latestPendingCount}</span>` : ''}
+    </a>
+    <a href="#/completion" class="nav-link ${completionActive ? 'active' : ''}">
+      <span class="icon-row">${icon('bar-chart', 16)} DIC Completion Rate</span>
     </a>
     <a href="#/" class="nav-link ${allActive ? 'active' : ''}">
       <span class="icon-row">${icon('layout-list', 16)} All Guides</span>
@@ -149,6 +155,7 @@ function parseRoute(hash) {
   if (hash === '#/' || hash === '#' || hash === '') return { name: 'landing' };
   if (hash === '#/cases') return { name: 'cases' };
   if (hash === '#/new-guide') return { name: 'new-guide' };
+  if (hash === '#/completion') return { name: 'completion' };
   const m = hash.match(/^#\/guides\/(.+)$/);
   if (m) return { name: 'guide', id: decodeURIComponent(m[1]) };
   return { name: 'landing' };
@@ -175,6 +182,8 @@ function onRouteChange() {
     mountCaseTracker(page);
   } else if (route.name === 'new-guide') {
     mountNewGuidePage(page);
+  } else if (route.name === 'completion') {
+    mountCompletionPage(page);
   }
 }
 
@@ -222,15 +231,23 @@ function mountGuidesLanding(container) {
       });
     }
 
+    const allCategories = new Set(latestGuides.map((g) => g.category));
+    const totalImages = latestGuides.reduce((sum, g) => sum + g.blocks.filter((b) => b.type === 'image').length, 0);
+
     container.innerHTML = `
       <div class="page wide">
-        <div class="case-head" style="margin-bottom:32px;">
+        <div class="case-head" style="margin-bottom:8px;">
           <div>
             <p class="eyebrow">TRAINING LIBRARY</p>
             <h2>DIC procedure guides</h2>
             <p class="page-desc">Every dial-in procedure the team uses, pulled straight from the training workbook. Open any guide to read the full steps and screenshots, or hit Edit to correct or expand it.</p>
           </div>
           <a href="#/new-guide" class="log-case-btn">${icon('list-plus', 16)} New guide</a>
+        </div>
+        <div class="stat-strip">
+          <div class="stat-chip"><span class="stat-num">${latestGuides.length}</span><span class="stat-label">Guides</span></div>
+          <div class="stat-chip"><span class="stat-num">${allCategories.size}</span><span class="stat-label">Categories</span></div>
+          <div class="stat-chip"><span class="stat-num">${totalImages}</span><span class="stat-label">Screenshots</span></div>
         </div>
         ${groupsHtml}
       </div>
@@ -993,6 +1010,159 @@ function mountCaseTracker(container) {
   renderZeroPendingBanner();
   renderList();
   renderModal();
+
+  currentCleanup = () => {
+    unsub();
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Page: DIC Completion Rate (training progress matrix)
+// ---------------------------------------------------------------------------
+
+function mountCompletionPage(container) {
+  function progressTone(pct) {
+    if (pct >= 0.8) return 'good';
+    if (pct >= 0.5) return 'mid';
+    return 'low';
+  }
+
+  function render() {
+    const data = getCompletion();
+    const { tasks, agents } = data;
+
+    const headerCells = agents
+      .map((agent) => {
+        const pct = agentProgress(data, agent.id);
+        const tone = progressTone(pct);
+        return `
+          <th class="matrix-agent-col">
+            <div class="matrix-agent-head">
+              <button class="matrix-agent-name" data-action="rename-agent" data-agent="${agent.id}" title="Rename">${escapeHtml(agent.name)}</button>
+              <button class="matrix-remove-btn" data-action="remove-agent" data-agent="${agent.id}" title="Remove agent">${icon('x', 11)}</button>
+            </div>
+            <div class="matrix-pct matrix-pct-${tone}">${Math.round(pct * 100)}%</div>
+            <div class="matrix-bar"><div class="matrix-bar-fill matrix-bar-${tone}" style="width:${Math.round(pct * 100)}%"></div></div>
+          </th>
+        `;
+      })
+      .join('');
+
+    const bodyRows = tasks
+      .map((task) => {
+        const cells = agents
+          .map((agent) => {
+            const status = (data.status[task.id] || {})[agent.id] || 'pending';
+            const done = status === 'done';
+            return `
+              <td>
+                <button class="matrix-cell ${done ? 'is-done' : 'is-pending'}" data-action="toggle-cell" data-task="${task.id}" data-agent="${agent.id}" title="${done ? 'Completed \u2014 click to mark not yet' : 'Not yet \u2014 click to mark completed'}">
+                  ${done ? icon('check', 14) : ''}
+                </button>
+              </td>
+            `;
+          })
+          .join('');
+        return `
+          <tr>
+            <td class="matrix-task-col">
+              <div class="matrix-task-row">
+                <span class="matrix-task-label" data-action="rename-task" data-task="${task.id}" title="Rename">${escapeHtml(task.label)}</span>
+                <button class="matrix-remove-btn" data-action="remove-task" data-task="${task.id}" title="Remove task">${icon('x', 11)}</button>
+              </div>
+            </td>
+            ${cells}
+          </tr>
+        `;
+      })
+      .join('');
+
+    const overallPct = agents.length
+      ? agents.reduce((sum, a) => sum + agentProgress(data, a.id), 0) / agents.length
+      : 0;
+
+    container.innerHTML = `
+      <div class="page wide">
+        <div class="case-head" style="margin-bottom:24px;">
+          <div>
+            <p class="eyebrow">TEAM TRAINING</p>
+            <h1>DIC Completion Rate</h1>
+            <p class="page-desc">Track who's been trained on each dial-in procedure. Click any cell to toggle it, add new agents as people join the team, and add new tasks as new procedures get rolled out.</p>
+          </div>
+          <div style="display:flex;gap:8px;flex-shrink:0;">
+            <button class="btn-secondary" id="add-task-btn">${icon('plus', 14)} Add task</button>
+            <button class="log-case-btn" id="add-agent-btn">${icon('users', 16)} Add agent</button>
+          </div>
+        </div>
+
+        ${
+          agents.length === 0 || tasks.length === 0
+            ? `<div class="empty-state">${tasks.length === 0 ? 'No tasks yet.' : 'No agents yet.'} Add ${tasks.length === 0 ? 'a task' : 'an agent'} to start tracking progress.</div>`
+            : `
+          <div class="matrix-summary">
+            <div class="matrix-summary-pct matrix-pct-${progressTone(overallPct)}">${Math.round(overallPct * 100)}%</div>
+            <div>
+              <div class="matrix-summary-label">Overall team readiness</div>
+              <div class="matrix-summary-sub">${tasks.length} task${tasks.length === 1 ? '' : 's'} &middot; ${agents.length} agent${agents.length === 1 ? '' : 's'}</div>
+            </div>
+          </div>
+          <div class="matrix-scroll">
+            <table class="matrix-table">
+              <thead>
+                <tr>
+                  <th class="matrix-task-col matrix-corner">DIC Task</th>
+                  ${headerCells}
+                </tr>
+              </thead>
+              <tbody>
+                ${bodyRows}
+              </tbody>
+            </table>
+          </div>
+        `
+        }
+      </div>
+    `;
+
+    document.getElementById('add-agent-btn').addEventListener('click', () => {
+      const name = prompt('Agent name?');
+      if (name && name.trim()) addCompletionAgent(name);
+    });
+    document.getElementById('add-task-btn').addEventListener('click', () => {
+      const label = prompt('New task / procedure name?');
+      if (label && label.trim()) addCompletionTask(label);
+    });
+
+    container.querySelectorAll('[data-action]').forEach((el) => {
+      el.addEventListener('click', () => {
+        const action = el.getAttribute('data-action');
+        if (action === 'toggle-cell') {
+          toggleCompletionStatus(el.getAttribute('data-task'), el.getAttribute('data-agent'));
+        } else if (action === 'rename-agent') {
+          const agentId = el.getAttribute('data-agent');
+          const current = agents.find((a) => a.id === agentId);
+          const next = prompt('Rename agent:', current ? current.name : '');
+          if (next && next.trim()) renameCompletionAgent(agentId, next);
+        } else if (action === 'remove-agent') {
+          if (confirm('Remove this agent from the tracker? Their progress will be lost.')) {
+            removeCompletionAgent(el.getAttribute('data-agent'));
+          }
+        } else if (action === 'rename-task') {
+          const taskId = el.getAttribute('data-task');
+          const current = tasks.find((t) => t.id === taskId);
+          const next = prompt('Rename task:', current ? current.label : '');
+          if (next && next.trim()) renameCompletionTask(taskId, next);
+        } else if (action === 'remove-task') {
+          if (confirm('Remove this task from the tracker?')) {
+            removeCompletionTask(el.getAttribute('data-task'));
+          }
+        }
+      });
+    });
+  }
+
+  const unsub = subscribeCompletion(() => render());
+  render();
 
   currentCleanup = () => {
     unsub();
